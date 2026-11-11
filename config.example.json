@@ -1,0 +1,9 @@
+{
+  "bot_token": "",
+  "target_usernames": [
+    "@username1",
+    "@username2"
+  ],
+  "destination_chat_id": null,
+  "source_chat_ids": []
+}
