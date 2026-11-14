@@ -54,12 +54,30 @@ class BaleAPI:
 
 
 def load_config(path, list_chats=False):
-    config = json.loads(path.read_text(encoding="utf-8-sig"))
+    try:
+        config = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        config = {}
+    if not isinstance(config, dict):
+        raise ValueError("config.json must contain an object.")
     config["bot_token"] = os.environ.get("BALE_BOT_TOKEN") or config.get("bot_token", "")
-    if not config["bot_token"].strip():
+    if not isinstance(config["bot_token"], str) or not config["bot_token"].strip():
         raise ValueError("Set bot_token in config.json or BALE_BOT_TOKEN.")
     if list_chats:
         return config
+    if "BALE_TARGET_USERNAMES" in os.environ:
+        config["target_usernames"] = [name.strip() for name in os.environ["BALE_TARGET_USERNAMES"].split(",") if name.strip()]
+    if "BALE_DESTINATION_CHAT_ID" in os.environ:
+        try:
+            config["destination_chat_id"] = int(os.environ["BALE_DESTINATION_CHAT_ID"].strip())
+        except ValueError:
+            raise ValueError("BALE_DESTINATION_CHAT_ID must be a numeric group ID.") from None
+    if "BALE_SOURCE_CHAT_IDS" in os.environ:
+        try:
+            source_ids = os.environ["BALE_SOURCE_CHAT_IDS"].strip()
+            config["source_chat_ids"] = [int(item.strip()) for item in source_ids.split(",")] if source_ids else []
+        except ValueError:
+            raise ValueError("BALE_SOURCE_CHAT_IDS must be comma-separated numeric group IDs.") from None
     names = config.get("target_usernames", [])
     if not isinstance(names, list) or not names:
         raise ValueError("target_usernames must be a nonempty list of @usernames.")
@@ -75,16 +93,6 @@ def load_config(path, list_chats=False):
     sources = config.get("source_chat_ids", [])
     if not isinstance(sources, list) or any(type(item) is not int for item in sources):
         raise ValueError("source_chat_ids must be a list of numeric group IDs, or [].")
-    templates = config.get("source_link_templates", {})
-    if not isinstance(templates, dict):
-        raise ValueError("source_link_templates must be an object keyed by source group ID.")
-    for template in templates.values():
-        if not isinstance(template, str) or not template.startswith("https://"):
-            raise ValueError("Each source link template must be an HTTPS URL.")
-        try:
-            template.format(chat_id=1, message_id=1, date=1700000000, date_ms=1700000000000)
-        except (KeyError, IndexError, ValueError, AttributeError):
-            raise ValueError("Invalid source link template placeholders.") from None
     return config
 
 
@@ -118,24 +126,12 @@ def should_forward(message, config):
     )
 
 
-def source_message_url(message, config):
-    """Use the permalink shape emitted by the official Bale web client."""
-    chat = message["chat"]
-    templates = config.get("source_link_templates", {})
-    template = templates.get(str(chat["id"]))
-    date = message.get("date")
-    if not template and date is None:
-        return None
-    values = {"chat_id": chat["id"], "message_id": message["message_id"],
-              "date": date, "date_ms": int(date * 1000) if date is not None else None}
-    if template:
-        return template.format(**values)
-    group = chat.get("username") or f"post/{chat['id']}"
-    return f"https://ble.ir/{group}/{values['message_id']}/{values['date_ms']}"
-
-
-def reply_button(forwarded_id):
-    return {"inline_keyboard": [[{"text": "جواب به این پیام", "callback_data": f"reply:{forwarded_id}"}]]}
+def reply_button(forwarded_id, source, username):
+    group = username if isinstance(username, str) and re.fullmatch(r"[A-Za-z0-9_]+", username) else str(source)
+    return {"inline_keyboard": [
+        [{"text": "رفتن به گروه مبدأ ↗", "url": f"https://ble.ir/{group}"}],
+        [{"text": "جواب به این پیام", "callback_data": f"reply:{forwarded_id}"}],
+    ]}
 
 
 class Store:
@@ -163,7 +159,7 @@ class Store:
             );
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
-        for name, kind in (("source_url", "TEXT"), ("forwarded_id", "INTEGER")):
+        for name, kind in (("source_url", "TEXT"), ("forwarded_id", "INTEGER"), ("source_username", "TEXT")):
             if name not in columns:
                 self.db.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
         self.db.commit()
@@ -233,19 +229,19 @@ class Store:
                                                 (config["destination_chat_id"], user_id))
                 if message and should_forward(message, config):
                     self.db.execute(
-                        "INSERT OR IGNORE INTO jobs (source,message,destination,source_url) VALUES (?,?,?,?)",
+                        "INSERT OR IGNORE INTO jobs (source,message,destination,source_username) VALUES (?,?,?,?)",
                         (message["chat"]["id"], message["message_id"], config["destination_chat_id"],
-                         source_message_url(message, config)),
+                         message["chat"].get("username")),
                     )
                 self.db.execute("INSERT OR REPLACE INTO state VALUES ('offset', ?)",
                                 (update["update_id"] + 1,))
 
     def forward_pending(self, api):
         rows = self.db.execute(
-            "SELECT source,message,destination,source_url,forwarded_id FROM jobs WHERE done=0 AND next_try<=? LIMIT 20",
+            "SELECT source,message,destination,source_username,forwarded_id FROM jobs WHERE done=0 AND next_try<=? LIMIT 20",
             (time.time(),),
         ).fetchall()
-        for source, message, destination, url, forwarded_id in rows:
+        for source, message, destination, username, forwarded_id in rows:
             try:
                 if forwarded_id is None:
                     forwarded = api.call("forwardMessage", chat_id=destination,
@@ -258,8 +254,8 @@ class Store:
                             (forwarded_id, source, message, destination))
                 api.call("sendMessage", chat_id=destination,
                          reply_to_message_id=forwarded_id,
-                         text="برای پاسخ، دکمه را بزنید و متن پاسخ را در گروه بنویسید. برای لغو /cancel را بفرستید.",
-                         reply_markup=reply_button(forwarded_id))
+                         text="برای رفتن به گروه مبدأ یا پاسخ از این گروه، یکی از دکمه‌ها را بزنید. برای لغو پاسخ /cancel را بفرستید.",
+                         reply_markup=reply_button(forwarded_id, source, username))
             except APIError as exc:
                 if exc.code in {401, 409}:
                     raise

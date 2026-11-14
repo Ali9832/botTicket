@@ -1,7 +1,9 @@
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from bot import APIError, Store, mentioned, should_forward, source_message_url
+from bot import APIError, Store, load_config, mentioned, should_forward
 
 
 CONFIG = {"target_usernames": {"support", "admin"},
@@ -14,6 +16,31 @@ def message(text="سلام @support", chat_id=-1):
 
 
 class ForwarderTests(unittest.TestCase):
+    def test_environment_configuration_without_file(self):
+        env = {"BALE_BOT_TOKEN": "token", "BALE_TARGET_USERNAMES": "@support, @admin",
+               "BALE_DESTINATION_CHAT_ID": "-99", "BALE_SOURCE_CHAT_IDS": "-1,-2"}
+        with TemporaryDirectory() as directory, patch.dict("os.environ", env, clear=True):
+            config = load_config(Path(directory) / "config.json")
+        self.assertEqual(config["target_usernames"], {"support", "admin"})
+        self.assertEqual(config["destination_chat_id"], -99)
+        self.assertEqual(config["source_chat_ids"], [-1, -2])
+
+    def test_environment_overrides_file_and_rejects_invalid_sources(self):
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text('{"bot_token":"old", "target_usernames":["@admin"], "destination_chat_id":1}', encoding="utf-8")
+            env = {"BALE_BOT_TOKEN": "new", "BALE_DESTINATION_CHAT_ID": "-99",
+                   "BALE_SOURCE_CHAT_IDS": "-1,"}
+            with patch.dict("os.environ", env, clear=True):
+                with self.assertRaisesRegex(ValueError, "BALE_SOURCE_CHAT_IDS"):
+                    load_config(path)
+                env["BALE_SOURCE_CHAT_IDS"] = ""
+            with patch.dict("os.environ", env, clear=True):
+                config = load_config(path)
+            self.assertEqual(config["bot_token"], "new")
+            self.assertEqual(config["destination_chat_id"], -99)
+            self.assertEqual(config["source_chat_ids"], [])
+
     def test_matches_either_target_and_whole_handle(self):
         self.assertTrue(mentioned(message("@ADMIN لطفاً"), CONFIG["target_usernames"]))
         for text in ("support", "@support_more", "mail@support.org", "@supportفارسی"):
@@ -66,8 +93,9 @@ class ForwarderTests(unittest.TestCase):
         self.assertEqual(reply.args, ("sendMessage",))
         self.assertEqual(reply.kwargs["reply_to_message_id"], 42)
         self.assertEqual(reply.kwargs["chat_id"], -99)
-        button = reply.kwargs["reply_markup"]["inline_keyboard"][0][0]
-        self.assertEqual(button, {"text": "جواب به این پیام", "callback_data": "reply:42"})
+        buttons = reply.kwargs["reply_markup"]["inline_keyboard"]
+        self.assertEqual(buttons[0][0]["url"], "https://ble.ir/-1")
+        self.assertEqual(buttons[1][0], {"text": "جواب به این پیام", "callback_data": "reply:42"})
 
     def test_failure_stays_queued_and_other_messages_continue(self):
         store = Store(":memory:")
@@ -82,13 +110,17 @@ class ForwarderTests(unittest.TestCase):
         self.assertEqual(store.db.execute("SELECT COUNT(*) FROM jobs WHERE done=1").fetchone()[0], 1)
         self.assertEqual(store.offset(), 6)
 
-    def test_private_public_and_custom_source_links(self):
+    def test_group_username_is_saved_and_used_in_button(self):
         msg = message()
-        self.assertEqual(source_message_url(msg, CONFIG), "https://ble.ir/post/-1/7/1700000000000")
         msg["chat"]["username"] = "my_group"
-        self.assertEqual(source_message_url(msg, CONFIG), "https://ble.ir/my_group/7/1700000000000")
-        config = dict(CONFIG, source_link_templates={"-1": "https://ble.ir/example/{message_id}"})
-        self.assertEqual(source_message_url(msg, config), "https://ble.ir/example/7")
+        store = Store(":memory:")
+        self.addCleanup(store.db.close)
+        store.ingest([{"update_id": 1, "message": msg}], CONFIG)
+        api = Mock()
+        api.call.return_value = {"message_id": 42}
+        store.forward_pending(api)
+        button = api.call.call_args.kwargs["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(button["url"], "https://ble.ir/my_group")
 
     def test_failed_button_is_retried_without_reforwarding(self):
         store = Store(":memory:")
