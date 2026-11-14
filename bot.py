@@ -69,9 +69,9 @@ def load_config(path, list_chats=False):
         config["target_usernames"] = [name.strip() for name in os.environ["BALE_TARGET_USERNAMES"].split(",") if name.strip()]
     if "BALE_DESTINATION_CHAT_ID" in os.environ:
         try:
-            config["destination_chat_id"] = int(os.environ["BALE_DESTINATION_CHAT_ID"].strip())
+            config["destination_chat_ids"] = [int(item.strip()) for item in os.environ["BALE_DESTINATION_CHAT_ID"].split(",")]
         except ValueError:
-            raise ValueError("BALE_DESTINATION_CHAT_ID must be a numeric group ID.") from None
+            raise ValueError("BALE_DESTINATION_CHAT_ID must contain comma-separated numeric group IDs.") from None
     if "BALE_SOURCE_CHAT_IDS" in os.environ:
         try:
             source_ids = os.environ["BALE_SOURCE_CHAT_IDS"].strip()
@@ -87,9 +87,11 @@ def load_config(path, list_chats=False):
     if any(name in {"username1", "username2"} for name in names):
         raise ValueError("Replace the sample usernames in config.json.")
     config["target_usernames"] = set(names)
-    destination = config.get("destination_chat_id")
-    if isinstance(destination, bool) or not isinstance(destination, int) or destination == 0:
-        raise ValueError("destination_chat_id must be the numeric destination group ID.")
+    destinations = config.get("destination_chat_ids", [config.get("destination_chat_id")])
+    if not isinstance(destinations, list) or not destinations or any(type(item) is not int or item == 0 for item in destinations):
+        raise ValueError("destination_chat_id(s) must contain numeric destination group IDs.")
+    config["destination_chat_ids"] = list(dict.fromkeys(destinations))
+    config["destination_chat_id"] = config["destination_chat_ids"][0]
     sources = config.get("source_chat_ids", [])
     if not isinstance(sources, list) or any(type(item) is not int for item in sources):
         raise ValueError("source_chat_ids must be a list of numeric group IDs, or [].")
@@ -120,7 +122,7 @@ def should_forward(message, config):
     chat = message.get("chat", {})
     return (
         chat.get("type") in {"group", "supergroup"}
-        and chat.get("id") != config["destination_chat_id"]
+        and chat.get("id") not in config.get("destination_chat_ids", [config.get("destination_chat_id")])
         and (not config.get("source_chat_ids") or chat.get("id") in config["source_chat_ids"])
         and mentioned(message, config["target_usernames"])
     )
@@ -169,6 +171,7 @@ class Store:
         return row[0] if row else 0
 
     def ingest(self, updates, config):
+        destinations = config.get("destination_chat_ids", [config.get("destination_chat_id")])
         with self.db:
             for update in sorted(updates, key=lambda item: item["update_id"]):
                 if update["update_id"] < self.offset():
@@ -180,7 +183,7 @@ class Store:
                     user_id = (callback.get("from") or {}).get("id")
                     match = re.fullmatch(r"reply:(\d+)", callback.get("data") or "")
                     original = None
-                    if callback_chat == config["destination_chat_id"] and user_id is not None and match:
+                    if callback_chat in destinations and user_id is not None and match:
                         original = self.db.execute(
                             "SELECT source,message FROM jobs WHERE destination=? AND forwarded_id=?",
                             (callback_chat, int(match.group(1))),
@@ -192,47 +195,49 @@ class Store:
                     else:
                         answer = "پیام اصلی پیدا نشد."
                     self.db.execute("INSERT OR IGNORE INTO callback_answers VALUES (?,?)", (callback["id"], answer))
-                if update.get("message") and message.get("chat", {}).get("id") == config["destination_chat_id"]:
+                destination = (message or {}).get("chat", {}).get("id")
+                if update.get("message") and destination in destinations:
                     replied_id = (message.get("reply_to_message") or {}).get("message_id")
                     text = message.get("text")
                     user_id = (message.get("from") or {}).get("id")
                     if user_id is not None:
                         self.db.execute("DELETE FROM reply_selections WHERE destination=? AND user_id=? AND expires<?",
-                                        (config["destination_chat_id"], user_id, time.time()))
+                                        (destination, user_id, time.time()))
                         if text and text.strip() == "/cancel":
                             self.db.execute("DELETE FROM reply_selections WHERE destination=? AND user_id=?",
-                                            (config["destination_chat_id"], user_id))
+                                            (destination, user_id))
                         elif text and not text.startswith("/") and replied_id is None:
                             original = self.db.execute(
                                 "SELECT source,original_message FROM reply_selections WHERE destination=? AND user_id=?",
-                                (config["destination_chat_id"], user_id),
+                                (destination, user_id),
                             ).fetchone()
                             if original:
                                 self.db.execute(
                                     "INSERT OR IGNORE INTO replies (destination,message,source,original_message,text) VALUES (?,?,?,?,?)",
-                                    (config["destination_chat_id"], message["message_id"], *original, text),
+                                    (destination, message["message_id"], *original, text),
                                 )
                                 self.db.execute("DELETE FROM reply_selections WHERE destination=? AND user_id=?",
-                                                (config["destination_chat_id"], user_id))
+                                                (destination, user_id))
                     if replied_id is not None and text:
                         original = self.db.execute(
                             "SELECT source,message FROM jobs WHERE destination=? AND forwarded_id=?",
-                            (config["destination_chat_id"], replied_id),
+                            (destination, replied_id),
                         ).fetchone()
                         if original:
                             self.db.execute(
                                 "INSERT OR IGNORE INTO replies (destination,message,source,original_message,text) VALUES (?,?,?,?,?)",
-                                (config["destination_chat_id"], message["message_id"], *original, text),
+                                (destination, message["message_id"], *original, text),
                             )
                             if user_id is not None:
                                 self.db.execute("DELETE FROM reply_selections WHERE destination=? AND user_id=?",
-                                                (config["destination_chat_id"], user_id))
+                                                (destination, user_id))
                 if message and should_forward(message, config):
-                    self.db.execute(
-                        "INSERT OR IGNORE INTO jobs (source,message,destination,source_username) VALUES (?,?,?,?)",
-                        (message["chat"]["id"], message["message_id"], config["destination_chat_id"],
-                         message["chat"].get("username")),
-                    )
+                    for destination in destinations:
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO jobs (source,message,destination,source_username) VALUES (?,?,?,?)",
+                            (message["chat"]["id"], message["message_id"], destination,
+                             message["chat"].get("username")),
+                        )
                 self.db.execute("INSERT OR REPLACE INTO state VALUES ('offset', ?)",
                                 (update["update_id"] + 1,))
 

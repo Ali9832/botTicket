@@ -41,6 +41,37 @@ class ForwarderTests(unittest.TestCase):
             self.assertEqual(config["destination_chat_id"], -99)
             self.assertEqual(config["source_chat_ids"], [])
 
+    def test_multiple_destination_configuration_and_validation(self):
+        env = {"BALE_BOT_TOKEN": "token", "BALE_TARGET_USERNAMES": "@support",
+               "BALE_DESTINATION_CHAT_ID": "-99, -98,-99"}
+        with TemporaryDirectory() as directory, patch.dict("os.environ", env, clear=True):
+            path = Path(directory) / "config.json"
+            config = load_config(path)
+            self.assertEqual(config["destination_chat_ids"], [-99, -98])
+            self.assertFalse(should_forward(message(chat_id=-98), config))
+            with patch.dict("os.environ", {"BALE_DESTINATION_CHAT_ID": "-99,"}):
+                with self.assertRaisesRegex(ValueError, "BALE_DESTINATION_CHAT_ID"):
+                    load_config(path)
+
+    def test_multiple_destinations_keep_replies_separate(self):
+        config = dict(CONFIG, destination_chat_ids=[-99, -98])
+        store = Store(":memory:")
+        self.addCleanup(store.db.close)
+        store.ingest([{"update_id": 1, "message": message()}], config)
+        self.assertEqual(store.db.execute("SELECT destination FROM jobs ORDER BY destination").fetchall(), [(-99,), (-98,)])
+        forward_api = Mock()
+        forward_api.call.return_value = {"message_id": 42}
+        store.forward_pending(forward_api)
+        forwarded_to = {call.kwargs["chat_id"] for call in forward_api.call.call_args_list
+                        if call.args[0] == "forwardMessage"}
+        self.assertEqual(forwarded_to, {-99, -98})
+        store.ingest([{"update_id": 2, "message": {"message_id": 100, "chat": {"id": -98},
+                      "text": "پاسخ", "reply_to_message": {"message_id": 42}}}], config)
+        api = Mock()
+        store.send_pending_replies(api)
+        api.call.assert_called_once_with("sendMessage", chat_id=-1, reply_to_message_id=7, text="پاسخ")
+        self.assertEqual(store.db.execute("SELECT destination FROM replies").fetchone(), (-98,))
+
     def test_matches_either_target_and_whole_handle(self):
         self.assertTrue(mentioned(message("@ADMIN لطفاً"), CONFIG["target_usernames"]))
         for text in ("support", "@support_more", "mail@support.org", "@supportفارسی"):
