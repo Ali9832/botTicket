@@ -66,9 +66,8 @@ class ForwarderTests(unittest.TestCase):
         self.assertEqual(reply.args, ("sendMessage",))
         self.assertEqual(reply.kwargs["reply_to_message_id"], 42)
         self.assertEqual(reply.kwargs["chat_id"], -99)
-        self.assertIn("https://ble.ir/post/-1/7/1700000000000", reply.kwargs["text"])
-        self.assertEqual(reply.kwargs["reply_markup"]["inline_keyboard"][0][0]["url"],
-                         "https://ble.ir/post/-1/7/1700000000000")
+        button = reply.kwargs["reply_markup"]["inline_keyboard"][0][0]
+        self.assertEqual(button, {"text": "جواب به این پیام", "callback_data": "reply:42"})
 
     def test_failure_stays_queued_and_other_messages_continue(self):
         store = Store(":memory:")
@@ -135,6 +134,104 @@ class ForwarderTests(unittest.TestCase):
             "SELECT done, forwarded_id, next_try FROM jobs").fetchone()
         self.assertEqual((done, forwarded_id), (0, 42))
         self.assertGreater(next_try, 0)
+
+    def test_destination_reply_is_sent_to_the_matching_original(self):
+        store = Store(":memory:")
+        self.addCleanup(store.db.close)
+        store.ingest([{"update_id": 1, "message": message()},
+                      {"update_id": 2, "message": message(chat_id=-2)}], CONFIG)
+        store.db.execute("UPDATE jobs SET forwarded_id=42 WHERE source=-1")
+        store.db.execute("UPDATE jobs SET forwarded_id=43 WHERE source=-2")
+        store.db.commit()
+        reply = {"message_id": 100, "chat": {"id": -99, "type": "group"},
+                 "text": "پاسخ دوم", "reply_to_message": {"message_id": 43}}
+        store.ingest([{"update_id": 3, "message": reply},
+                      {"update_id": 4, "edited_message": reply}], CONFIG)
+        api = Mock()
+        store.send_pending_replies(api)
+        store.send_pending_replies(api)
+        api.call.assert_called_once_with("sendMessage", chat_id=-2, reply_to_message_id=7, text="پاسخ دوم")
+
+    def test_unmatched_and_nontext_replies_are_not_sent(self):
+        store = Store(":memory:")
+        self.addCleanup(store.db.close)
+        store.ingest([{"update_id": 1, "message": message()}], CONFIG)
+        store.db.execute("UPDATE jobs SET forwarded_id=42")
+        store.db.commit()
+        for update_id, replied_id, content in ((2, 999, {"text": "نامرتبط"}), (3, 42, {"photo": []})):
+            store.ingest([{"update_id": update_id, "message": {
+                "message_id": update_id, "chat": {"id": -99},
+                "reply_to_message": {"message_id": replied_id}, **content}}], CONFIG)
+        api = Mock()
+        store.send_pending_replies(api)
+        api.call.assert_not_called()
+
+    def test_failed_destination_reply_is_retried(self):
+        store = Store(":memory:")
+        self.addCleanup(store.db.close)
+        store.ingest([{"update_id": 1, "message": message()}], CONFIG)
+        store.db.execute("UPDATE jobs SET forwarded_id=42")
+        store.db.commit()
+        store.ingest([{"update_id": 2, "message": {"message_id": 100,
+                      "chat": {"id": -99}, "text": "پاسخ",
+                      "reply_to_message": {"message_id": 42}}}], CONFIG)
+        api = Mock()
+        api.call.side_effect = [APIError(500, "temporary"), True]
+        with self.assertLogs("bale-ticket", level="WARNING"):
+            store.send_pending_replies(api)
+        store.db.execute("UPDATE replies SET next_try=0")
+        store.db.commit()
+        store.send_pending_replies(api)
+        self.assertEqual(api.call.call_count, 2)
+        self.assertEqual(store.db.execute("SELECT done FROM replies").fetchone()[0], 1)
+
+    def test_button_selection_routes_each_users_next_message(self):
+        store = Store(":memory:")
+        self.addCleanup(store.db.close)
+        store.ingest([{"update_id": 1, "message": message()},
+                      {"update_id": 2, "message": message(chat_id=-2)}], CONFIG)
+        store.db.execute("UPDATE jobs SET forwarded_id=42 WHERE source=-1")
+        store.db.execute("UPDATE jobs SET forwarded_id=43 WHERE source=-2")
+        store.db.commit()
+        updates = [
+            {"update_id": 3, "callback_query": {"id": "a", "from": {"id": 1},
+             "message": {"chat": {"id": -99}}, "data": "reply:42"}},
+            {"update_id": 4, "callback_query": {"id": "b", "from": {"id": 2},
+             "message": {"chat": {"id": -99}}, "data": "reply:43"}},
+            {"update_id": 5, "message": {"message_id": 50, "chat": {"id": -99},
+             "from": {"id": 2}, "text": "دوم"}},
+            {"update_id": 6, "message": {"message_id": 51, "chat": {"id": -99},
+             "from": {"id": 1}, "text": "اول"}},
+            {"update_id": 7, "message": {"message_id": 52, "chat": {"id": -99},
+             "from": {"id": 1}, "text": "پیام عادی"}},
+        ]
+        store.ingest(updates, CONFIG)
+        api = Mock()
+        store.send_pending_replies(api)
+        self.assertEqual([call.kwargs for call in api.call.call_args_list], [
+            {"chat_id": -2, "reply_to_message_id": 7, "text": "دوم"},
+            {"chat_id": -1, "reply_to_message_id": 7, "text": "اول"},
+        ])
+        store.answer_callbacks(api)
+        self.assertEqual(store.db.execute("SELECT COUNT(*) FROM callback_answers").fetchone()[0], 0)
+
+    def test_cancel_discards_button_selection(self):
+        store = Store(":memory:")
+        self.addCleanup(store.db.close)
+        store.ingest([{"update_id": 1, "message": message()}], CONFIG)
+        store.db.execute("UPDATE jobs SET forwarded_id=42")
+        store.db.commit()
+        store.ingest([
+            {"update_id": 2, "callback_query": {"id": "a", "from": {"id": 1},
+             "message": {"chat": {"id": -99}}, "data": "reply:42"}},
+            {"update_id": 3, "message": {"message_id": 3, "chat": {"id": -99},
+             "from": {"id": 1}, "text": "/cancel"}},
+            {"update_id": 4, "message": {"message_id": 4, "chat": {"id": -99},
+             "from": {"id": 1}, "text": "پیام عادی"}},
+        ], CONFIG)
+        api = Mock()
+        store.send_pending_replies(api)
+        api.call.assert_not_called()
 
 
 if __name__ == "__main__":

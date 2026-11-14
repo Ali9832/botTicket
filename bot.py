@@ -134,8 +134,8 @@ def source_message_url(message, config):
     return f"https://ble.ir/{group}/{values['message_id']}/{values['date_ms']}"
 
 
-def source_button(url):
-    return {"inline_keyboard": [[{"text": "رفتن به پیام اصلی ↗", "url": url}]]}
+def reply_button(forwarded_id):
+    return {"inline_keyboard": [[{"text": "جواب به این پیام", "callback_data": f"reply:{forwarded_id}"}]]}
 
 
 class Store:
@@ -147,6 +147,19 @@ class Store:
                 source INTEGER, message INTEGER, destination INTEGER,
                 done INTEGER NOT NULL DEFAULT 0, next_try REAL NOT NULL DEFAULT 0,
                 PRIMARY KEY (source, message, destination)
+            );
+            CREATE TABLE IF NOT EXISTS replies (
+                destination INTEGER, message INTEGER, source INTEGER,
+                original_message INTEGER, text TEXT,
+                done INTEGER NOT NULL DEFAULT 0, next_try REAL NOT NULL DEFAULT 0,
+                PRIMARY KEY (destination, message)
+            );
+            CREATE TABLE IF NOT EXISTS reply_selections (
+                destination INTEGER, user_id INTEGER, source INTEGER, original_message INTEGER,
+                expires REAL, PRIMARY KEY (destination, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS callback_answers (
+                id TEXT PRIMARY KEY, text TEXT NOT NULL
             );
         """)
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(jobs)")}
@@ -165,6 +178,59 @@ class Store:
                 if update["update_id"] < self.offset():
                     continue
                 message = update.get("message") or update.get("edited_message")
+                callback = update.get("callback_query")
+                if callback:
+                    callback_chat = (callback.get("message") or {}).get("chat", {}).get("id")
+                    user_id = (callback.get("from") or {}).get("id")
+                    match = re.fullmatch(r"reply:(\d+)", callback.get("data") or "")
+                    original = None
+                    if callback_chat == config["destination_chat_id"] and user_id is not None and match:
+                        original = self.db.execute(
+                            "SELECT source,message FROM jobs WHERE destination=? AND forwarded_id=?",
+                            (callback_chat, int(match.group(1))),
+                        ).fetchone()
+                    if original:
+                        self.db.execute("INSERT OR REPLACE INTO reply_selections VALUES (?,?,?,?,?)",
+                                        (callback_chat, user_id, *original, time.time() + 600))
+                        answer = "پاسخ بعدی خود را در گروه بنویسید. برای لغو /cancel را بفرستید."
+                    else:
+                        answer = "پیام اصلی پیدا نشد."
+                    self.db.execute("INSERT OR IGNORE INTO callback_answers VALUES (?,?)", (callback["id"], answer))
+                if update.get("message") and message.get("chat", {}).get("id") == config["destination_chat_id"]:
+                    replied_id = (message.get("reply_to_message") or {}).get("message_id")
+                    text = message.get("text")
+                    user_id = (message.get("from") or {}).get("id")
+                    if user_id is not None:
+                        self.db.execute("DELETE FROM reply_selections WHERE destination=? AND user_id=? AND expires<?",
+                                        (config["destination_chat_id"], user_id, time.time()))
+                        if text and text.strip() == "/cancel":
+                            self.db.execute("DELETE FROM reply_selections WHERE destination=? AND user_id=?",
+                                            (config["destination_chat_id"], user_id))
+                        elif text and not text.startswith("/") and replied_id is None:
+                            original = self.db.execute(
+                                "SELECT source,original_message FROM reply_selections WHERE destination=? AND user_id=?",
+                                (config["destination_chat_id"], user_id),
+                            ).fetchone()
+                            if original:
+                                self.db.execute(
+                                    "INSERT OR IGNORE INTO replies (destination,message,source,original_message,text) VALUES (?,?,?,?,?)",
+                                    (config["destination_chat_id"], message["message_id"], *original, text),
+                                )
+                                self.db.execute("DELETE FROM reply_selections WHERE destination=? AND user_id=?",
+                                                (config["destination_chat_id"], user_id))
+                    if replied_id is not None and text:
+                        original = self.db.execute(
+                            "SELECT source,message FROM jobs WHERE destination=? AND forwarded_id=?",
+                            (config["destination_chat_id"], replied_id),
+                        ).fetchone()
+                        if original:
+                            self.db.execute(
+                                "INSERT OR IGNORE INTO replies (destination,message,source,original_message,text) VALUES (?,?,?,?,?)",
+                                (config["destination_chat_id"], message["message_id"], *original, text),
+                            )
+                            if user_id is not None:
+                                self.db.execute("DELETE FROM reply_selections WHERE destination=? AND user_id=?",
+                                                (config["destination_chat_id"], user_id))
                 if message and should_forward(message, config):
                     self.db.execute(
                         "INSERT OR IGNORE INTO jobs (source,message,destination,source_url) VALUES (?,?,?,?)",
@@ -190,13 +256,10 @@ class Store:
                         self.db.execute(
                             "UPDATE jobs SET forwarded_id=? WHERE source=? AND message=? AND destination=?",
                             (forwarded_id, source, message, destination))
-                if url:
-                    api.call("sendMessage", chat_id=destination,
-                             reply_to_message_id=forwarded_id,
-                             text="\u0628\u0631\u0627\u06cc \u0645\u0634\u0627\u0647\u062f\u0647\u0654 \u067e\u06cc\u0627\u0645 \u0627\u0635\u0644\u06cc\u060c \u062f\u06a9\u0645\u0647 \u06cc\u0627 \u0644\u06cc\u0646\u06a9 \u0632\u06cc\u0631 \u0631\u0627 \u0628\u0632\u0646\u06cc\u062f:\n" + url,
-                             reply_markup=source_button(url))
-                else:
-                    LOG.warning("Legacy queued message %s/%s has no source link metadata", source, message)
+                api.call("sendMessage", chat_id=destination,
+                         reply_to_message_id=forwarded_id,
+                         text="برای پاسخ، دکمه را بزنید و متن پاسخ را در گروه بنویسید. برای لغو /cancel را بفرستید.",
+                         reply_markup=reply_button(forwarded_id))
             except APIError as exc:
                 if exc.code in {401, 409}:
                     raise
@@ -214,6 +277,43 @@ class Store:
                     self.db.execute("UPDATE jobs SET done=1 WHERE source=? AND message=? AND destination=?",
                                     (source, message, destination))
                 LOG.info("Forwarded %s/%s", source, message)
+
+    def send_pending_replies(self, api):
+        rows = self.db.execute(
+            "SELECT destination,message,source,original_message,text FROM replies WHERE done=0 AND next_try<=? LIMIT 20",
+            (time.time(),),
+        ).fetchall()
+        for destination, message, source, original_message, text in rows:
+            try:
+                api.call("sendMessage", chat_id=source, reply_to_message_id=original_message, text=text)
+            except APIError as exc:
+                if exc.code in {401, 409}:
+                    raise
+                LOG.warning("Reply failed for %s/%s: API %s: %s (will retry)", destination, message, exc.code, exc)
+                delay = max(5, float(exc.retry_after), 300 if exc.code in {400, 403} else 15)
+                with self.db:
+                    self.db.execute("UPDATE replies SET next_try=? WHERE destination=? AND message=?",
+                                    (time.time() + delay, destination, message))
+                if exc.code == 429:
+                    break
+            else:
+                with self.db:
+                    self.db.execute("UPDATE replies SET done=1 WHERE destination=? AND message=?",
+                                    (destination, message))
+                LOG.info("Replied to %s/%s", source, original_message)
+
+    def answer_callbacks(self, api):
+        for callback_id, text in self.db.execute("SELECT id,text FROM callback_answers LIMIT 20").fetchall():
+            try:
+                api.call("answerCallbackQuery", callback_query_id=callback_id, text=text, show_alert=True)
+            except APIError as exc:
+                if exc.code in {401, 409}:
+                    raise
+                LOG.warning("Callback answer failed: API %s: %s", exc.code, exc)
+                if exc.code not in {400, 403}:
+                    continue
+            with self.db:
+                self.db.execute("DELETE FROM callback_answers WHERE id=?", (callback_id,))
 
 
 def main():
@@ -242,6 +342,8 @@ def main():
     while True:
         try:
             store.forward_pending(api)
+            store.send_pending_replies(api)
+            store.answer_callbacks(api)
             updates = api.call("getUpdates", offset=store.offset(), timeout=10, limit=100)
             store.ingest(updates, config)
             if not updates:
